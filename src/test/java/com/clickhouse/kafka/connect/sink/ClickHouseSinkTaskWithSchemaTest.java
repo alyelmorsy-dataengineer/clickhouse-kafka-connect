@@ -1966,6 +1966,7 @@ public class ClickHouseSinkTaskWithSchemaTest extends ClickHouseBase {
         return SchemaBuilder.struct().optional()
                 .name("io.debezium.connector.postgresql.Source")
                 .field("lsn", Schema.OPTIONAL_INT64_SCHEMA)
+                .field("ts_ms", Schema.OPTIONAL_INT64_SCHEMA)
                 .build();
     }
 
@@ -1975,12 +1976,22 @@ public class ClickHouseSinkTaskWithSchemaTest extends ClickHouseBase {
                 .field("before", rowSchema)
                 .field("after", rowSchema)
                 .field("source", debeziumSourceSchema())
+                .field("ts_ms", Schema.OPTIONAL_INT64_SCHEMA)
                 .build();
     }
 
     /** Builds a Debezium op=c (create) SinkRecord whose after struct is populated from afterValues. */
     private static SinkRecord debeziumCreateRecord(String topic, Schema rowSchema, long lsn, long offset,
                                                    Map<String, Object> afterValues) {
+        return debeziumCreateRecord(topic, rowSchema, lsn, offset, afterValues, null);
+    }
+
+    /**
+     * As above, but also sets source.ts_ms (the source commit time that feeds __ts_ms) and an
+     * envelope-level ts_ms offset from it, so tests can prove which of the two is written.
+     */
+    private static SinkRecord debeziumCreateRecord(String topic, Schema rowSchema, long lsn, long offset,
+                                                   Map<String, Object> afterValues, Long sourceTsMs) {
         Struct after = new Struct(rowSchema);
         afterValues.forEach(after::put);
         Schema envelopeSchema = debeziumEnvelopeSchema(rowSchema);
@@ -1989,6 +2000,10 @@ public class ClickHouseSinkTaskWithSchemaTest extends ClickHouseBase {
                 .put("op", "c")
                 .put("after", after)
                 .put("source", source);
+        if (sourceTsMs != null) {
+            source.put("ts_ms", sourceTsMs);
+            envelope.put("ts_ms", sourceTsMs + 29L);
+        }
         return new SinkRecord(topic, 0, null, null, envelopeSchema, envelope, offset);
     }
 
@@ -2064,6 +2079,104 @@ public class ClickHouseSinkTaskWithSchemaTest extends ClickHouseBase {
         assertEquals(1, ClickHouseTestHelpers.countRowsWhere(chc, topic,
                 "id = 15 AND email = 'user15@example.com'"),
                 "The evolved 'email' value should be readable back for a V2 record");
+    }
+
+    // Real source.ts_ms from a money_movements.public.transactions envelope.
+    private static final long DEBEZIUM_SOURCE_TS_MS = 1784538797286L;
+
+    @Test
+    public void debeziumCDCWritesSourceTsMsIntoTsMsColumn() {
+        Assumptions.assumeFalse(isCluster, "Test is disabled against cluster until issue #738 is resolved");
+        Map<String, String> props = getBaseProps();
+        props.put(ClickHouseSinkConfig.DEBEZIUM_CDC_ENABLED, "true");
+        ClickHouseHelperClient chc = ClickHouseTestHelpers.createClient(props);
+
+        String topic = createTopicName("debezium_ts_ms_test");
+        ClickHouseTestHelpers.dropTable(chc, topic);
+        new CreateTableStatement()
+                .column("id", "Int32")
+                .column("name", "String")
+                .column("_version", "UInt64")
+                .column("is_deleted", "UInt8")
+                .column("__ts_ms", "DateTime64(3)")
+                .engine("ReplacingMergeTree(_version, is_deleted)")
+                .orderByColumn("id")
+                .tableName(topic)
+                .execute(chc);
+
+        Schema row = SchemaBuilder.struct()
+                .field("id", Schema.INT32_SCHEMA)
+                .field("name", Schema.STRING_SCHEMA)
+                .build();
+
+        List<SinkRecord> records = new ArrayList<>();
+        for (int i = 1; i <= 10; i++) {
+            Map<String, Object> after = new HashMap<>();
+            after.put("id", i);
+            after.put("name", "name-" + i);
+            // Each row gets a distinct commit time so an off-by-one row mapping would show up.
+            records.add(debeziumCreateRecord(topic, row, 100L + i, i, after, DEBEZIUM_SOURCE_TS_MS + i));
+        }
+
+        ClickHouseSinkTask chst = new ClickHouseSinkTask();
+        chst.start(props);
+        chst.put(records);
+        chst.stop();
+
+        assertEquals(10, ClickHouseTestHelpers.countRows(chc, topic));
+
+        // Millisecond precision must survive the RowBinary DateTime64(3) encoding exactly, and the
+        // value must be source.ts_ms — not the envelope ts_ms, which is 29ms later. Comparing epoch
+        // millis rather than a formatted string keeps this independent of the server timezone.
+        for (int i = 1; i <= 10; i++) {
+            long expectedMillis = DEBEZIUM_SOURCE_TS_MS + i;
+            assertEquals(1, ClickHouseTestHelpers.countRowsWhere(chc, topic,
+                    String.format("id = %d AND toUnixTimestamp64Milli(__ts_ms) = %d", i, expectedMillis)),
+                    "__ts_ms for id=" + i + " should equal source.ts_ms " + expectedMillis);
+        }
+    }
+
+    @Test
+    public void debeziumCDCSkipsTsMsWhenColumnAbsent() {
+        Assumptions.assumeFalse(isCluster, "Test is disabled against cluster until issue #738 is resolved");
+        Map<String, String> props = getBaseProps();
+        props.put(ClickHouseSinkConfig.DEBEZIUM_CDC_ENABLED, "true");
+        ClickHouseHelperClient chc = ClickHouseTestHelpers.createClient(props);
+
+        String topic = createTopicName("debezium_no_ts_ms_test");
+        ClickHouseTestHelpers.dropTable(chc, topic);
+        // Deliberately no __ts_ms column: the injected value must be dropped, not fail the insert.
+        new CreateTableStatement()
+                .column("id", "Int32")
+                .column("name", "String")
+                .column("_version", "UInt64")
+                .column("is_deleted", "UInt8")
+                .engine("ReplacingMergeTree(_version, is_deleted)")
+                .orderByColumn("id")
+                .tableName(topic)
+                .execute(chc);
+
+        Schema row = SchemaBuilder.struct()
+                .field("id", Schema.INT32_SCHEMA)
+                .field("name", Schema.STRING_SCHEMA)
+                .build();
+
+        List<SinkRecord> records = new ArrayList<>();
+        for (int i = 1; i <= 10; i++) {
+            Map<String, Object> after = new HashMap<>();
+            after.put("id", i);
+            after.put("name", "name-" + i);
+            records.add(debeziumCreateRecord(topic, row, 100L + i, i, after, DEBEZIUM_SOURCE_TS_MS + i));
+        }
+
+        ClickHouseSinkTask chst = new ClickHouseSinkTask();
+        chst.start(props);
+        chst.put(records);
+        chst.stop();
+
+        assertEquals(10, ClickHouseTestHelpers.countRows(chc, topic));
+        assertFalse(chc.describeTable(chc.getDatabase(), topic).getRootColumnsMap().containsKey("__ts_ms"),
+                "__ts_ms must not be created implicitly when auto.evolve is off");
     }
 
     @Test

@@ -33,8 +33,11 @@ import java.util.Map;
  *   op = "t"             → skip (truncate not supported)
  *
  * Injected columns:
- *   _version   UInt64  — source.lsn (PostgreSQL) or parsed source.gtid (MySQL)
- *   is_deleted UInt8   — 0 for upserts, 1 for deletes
+ *   _version   UInt64       — source.lsn (PostgreSQL) or parsed source.gtid (MySQL)
+ *   is_deleted UInt8        — 0 for upserts, 1 for deletes
+ *   __ts_ms    DateTime64(3) — source.ts_ms, the commit time in the source database.
+ *                             Enables end-to-end latency measurement (source commit → ClickHouse).
+ *                             Omitted when the envelope carries no source.ts_ms.
  *
  * Type conversions (mirrors Altinity ClickHouseDataTypeMapper):
  *   STRING (no logical type)                 → String (pass-through)
@@ -59,12 +62,19 @@ public class DebeziumRecordConvertor extends RecordConvertor {
     private static final String FIELD_POS        = "pos";
     private static final String FIELD_CHANGE_LSN  = "change_lsn";   // SQL Server streaming
     private static final String FIELD_COMMIT_LSN  = "commit_lsn";   // SQL Server snapshot + streaming fallback
+    private static final String FIELD_TS_MS      = "ts_ms";
 
     private static final String OP_DELETE   = "d";
     private static final String OP_TRUNCATE = "t";
 
     private static final String COL_VERSION    = "_version";
     private static final String COL_IS_DELETED = "is_deleted";
+    private static final String COL_TS_MS      = "__ts_ms";
+
+    // source.ts_ms is epoch millis. Wrapping it in the Connect Timestamp logical schema makes
+    // ClickHouseWriter.doWriteDates() rescale it per the column's precision, so a DateTime64 target
+    // is correct at any precision, and makes auto.evolve infer DateTime64(3) for the new column.
+    private static final Schema TS_MS_SCHEMA = org.apache.kafka.connect.data.Timestamp.builder().optional().build();
 
     // Debezium logical type names
     private static final String LOGICAL_MICRO_TIMESTAMP  = "io.debezium.time.MicroTimestamp";
@@ -99,7 +109,9 @@ public class DebeziumRecordConvertor extends RecordConvertor {
 
         Map<String, Data> jsonMap = toDebeziumJsonMap(dataStruct);
 
-        BigInteger version = extractVersion(envelope);
+        Struct source = readSourceStruct(envelope, topic);
+
+        BigInteger version = extractVersion(source);
         jsonMap.put(COL_VERSION,    new Data(Schema.BYTES_SCHEMA, version));
         jsonMap.put(COL_IS_DELETED, new Data(Schema.INT8_SCHEMA, isDelete ? (byte) 1 : (byte) 0));
 
@@ -107,6 +119,14 @@ public class DebeziumRecordConvertor extends RecordConvertor {
         List<Field> fields = new ArrayList<>(dataStruct.schema().fields());
         fields.add(new Field(COL_VERSION,    fields.size(), SchemaBuilder.bytes().build()));
         fields.add(new Field(COL_IS_DELETED, fields.size(), SchemaBuilder.int8().build()));
+
+        // Omitted rather than defaulted when absent, so a NULL means "no source commit time"
+        // instead of reporting a 1970 epoch as a ~56-year latency.
+        Long sourceTsMs = extractSourceTsMs(source);
+        if (sourceTsMs != null) {
+            jsonMap.put(COL_TS_MS, new Data(TS_MS_SCHEMA, new java.util.Date(sourceTsMs)));
+            fields.add(new Field(COL_TS_MS, fields.size(), TS_MS_SCHEMA));
+        }
 
         return Record.newRecord(SchemaType.DEBEZIUM_CDC,
                 topic, sinkRecord.kafkaPartition(), sinkRecord.kafkaOffset(),
@@ -247,11 +267,44 @@ public class DebeziumRecordConvertor extends RecordConvertor {
     }
 
     /**
+     * Reads the source struct once for both version and commit-time extraction. A malformed envelope
+     * without a source field would otherwise throw a DataException out of doConvert and, under
+     * errors.tolerance=none, kill the task; degrade to null so the record still writes.
+     */
+    private Struct readSourceStruct(Struct envelope, String topic) {
+        try {
+            return envelope.getStruct(FIELD_SOURCE);
+        } catch (Exception e) {
+            LOGGER.warn("Debezium envelope has no readable '{}' struct for topic={}: {}",
+                    FIELD_SOURCE, topic, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Extracts the source database commit time (source.ts_ms) as epoch millis, or null when absent.
+     * This is the change's commit time in the source DB — not envelope.ts_ms, which is when Debezium
+     * read it — so it is the correct anchor for end-to-end latency.
+     */
+    private Long extractSourceTsMs(Struct source) {
+        if (source == null) return null;
+
+        try {
+            Object tsMs = source.get(FIELD_TS_MS);
+            // Number, not Long: JsonConverter narrows small int64 values to Integer.
+            if (tsMs instanceof Number) return ((Number) tsMs).longValue();
+        } catch (Exception e) {
+            LOGGER.debug("Could not read source.ts_ms — field absent from envelope: {}", e.getMessage());
+        }
+
+        return null;
+    }
+
+    /**
      * Extracts the replication position from the Debezium source struct.
      * Priority: PostgreSQL LSN → MySQL GTID sequence number → MySQL binlog pos.
      */
-    private BigInteger extractVersion(Struct envelope) {
-        Struct source = envelope.getStruct(FIELD_SOURCE);
+    private BigInteger extractVersion(Struct source) {
         if (source == null) return BigInteger.ZERO;
 
         // PostgreSQL streaming: lsn is a Long

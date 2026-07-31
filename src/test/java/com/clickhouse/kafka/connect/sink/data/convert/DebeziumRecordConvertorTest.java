@@ -20,7 +20,9 @@ import java.util.Date;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -48,6 +50,7 @@ public class DebeziumRecordConvertorTest {
                 .field("pos", Schema.OPTIONAL_INT64_SCHEMA)
                 .field("change_lsn", Schema.OPTIONAL_STRING_SCHEMA)
                 .field("commit_lsn", Schema.OPTIONAL_STRING_SCHEMA)
+                .field("ts_ms", Schema.OPTIONAL_INT64_SCHEMA)
                 .build();
     }
 
@@ -57,6 +60,9 @@ public class DebeziumRecordConvertorTest {
                 .field("before", rowSchema)
                 .field("after", rowSchema)
                 .field("source", sourceSchema())
+                // Envelope-level ts_ms (when Debezium read the change) coexists with source.ts_ms
+                // (when the source DB committed it); only the latter must reach __ts_ms.
+                .field("ts_ms", Schema.OPTIONAL_INT64_SCHEMA)
                 .build();
     }
 
@@ -64,6 +70,10 @@ public class DebeziumRecordConvertorTest {
         Struct s = new Struct(schema);
         s.put("lsn", lsn);
         return s;
+    }
+
+    private static Struct sourceStruct(Schema schema, Long lsn, Long tsMs) {
+        return sourceStruct(schema, lsn).put("ts_ms", tsMs);
     }
 
     private static SinkRecord sinkRecord(Struct envelope) {
@@ -569,5 +579,168 @@ public class DebeziumRecordConvertorTest {
         Record record = Record.convert(sinkRecord, false, "_", DATABASE, true);
 
         assertEquals(SchemaType.DEBEZIUM_CDC, record.getSchemaType());
+    }
+
+    // ===========================================================================
+    // __ts_ms (source commit time, for end-to-end latency)
+    // ===========================================================================
+
+    // Real values from a money_movements.public.transactions envelope: the two timestamps differ by
+    // 29ms, so picking the wrong one is detectable.
+    private static final long PG_SOURCE_TS_MS   = 1784538797286L;
+    private static final long PG_ENVELOPE_TS_MS = 1784538797315L;
+
+    @Test
+    @DisplayName("__ts_ms comes from source.ts_ms, not the envelope-level ts_ms")
+    void tsMs_takenFromSourceNotEnvelope() {
+        Schema row = rowSchema(SchemaBuilder.int32().name("id"));
+        Schema env = envelopeSchema(row);
+        Struct after = new Struct(row).put("id", 1);
+        Struct envelope = new Struct(env)
+                .put("op", "u").put("after", after)
+                .put("source", sourceStruct(sourceSchema(), 12193222727040L, PG_SOURCE_TS_MS))
+                .put("ts_ms", PG_ENVELOPE_TS_MS);
+
+        Record record = convert(envelope);
+
+        assertEquals(new Date(PG_SOURCE_TS_MS), record.getJsonMap().get("__ts_ms").getObject());
+        assertNotEquals(new Date(PG_ENVELOPE_TS_MS), record.getJsonMap().get("__ts_ms").getObject());
+    }
+
+    @Test
+    @DisplayName("__ts_ms is wrapped as an INT64 Timestamp so DateTime64 columns rescale correctly")
+    void tsMs_usesTimestampLogicalSchema() {
+        Schema row = rowSchema(SchemaBuilder.int32().name("id"));
+        Schema env = envelopeSchema(row);
+        Struct after = new Struct(row).put("id", 1);
+        Struct envelope = new Struct(env)
+                .put("op", "c").put("after", after)
+                .put("source", sourceStruct(sourceSchema(), 1L, PG_SOURCE_TS_MS));
+
+        Record record = convert(envelope);
+
+        assertEquals(Schema.Type.INT64, record.getJsonMap().get("__ts_ms").getFieldType());
+        assertInstanceOf(Date.class, record.getJsonMap().get("__ts_ms").getObject());
+
+        Map<String, Field> fieldsByName = new java.util.HashMap<>();
+        for (Field f : record.getFields()) fieldsByName.put(f.name(), f);
+        assertTrue(fieldsByName.containsKey("__ts_ms"));
+        assertEquals(Schema.Type.INT64, fieldsByName.get("__ts_ms").schema().type());
+        // auto.evolve maps this logical name to DateTime64(3).
+        assertEquals(Timestamp.LOGICAL_NAME, fieldsByName.get("__ts_ms").schema().name());
+    }
+
+    @Test
+    @DisplayName("SQL Server envelope (commit_lsn version path) still yields __ts_ms")
+    void tsMs_sqlServerEnvelope() {
+        long sqlServerSourceTsMs = 1784139321120L;
+        Schema row = rowSchema(SchemaBuilder.int32().name("ClientBalanceID"));
+        Schema env = envelopeSchema(row);
+        Struct after = new Struct(row).put("ClientBalanceID", 42205591);
+        Struct source = new Struct(sourceSchema())
+                .put("change_lsn", "000888fe:000851d0:008b")
+                .put("commit_lsn", "000888fe:000852c0:00e9")
+                .put("ts_ms", sqlServerSourceTsMs);
+        Struct envelope = new Struct(env)
+                .put("op", "c").put("after", after)
+                .put("source", source)
+                .put("ts_ms", 1784139327757L);
+
+        Record record = convert(envelope);
+
+        assertEquals(new Date(sqlServerSourceTsMs), record.getJsonMap().get("__ts_ms").getObject());
+    }
+
+    @Test
+    @DisplayName("op=d carries __ts_ms on the before-derived row")
+    void tsMs_presentOnDelete() {
+        Schema row = rowSchema(SchemaBuilder.int32().name("id"));
+        Schema env = envelopeSchema(row);
+        Struct before = new Struct(row).put("id", 7);
+        Struct envelope = new Struct(env)
+                .put("op", "d").put("before", before)
+                .put("source", sourceStruct(sourceSchema(), 5L, PG_SOURCE_TS_MS));
+
+        Record record = convert(envelope);
+
+        assertEquals((byte) 1, record.getJsonMap().get("is_deleted").getObject());
+        assertEquals(new Date(PG_SOURCE_TS_MS), record.getJsonMap().get("__ts_ms").getObject());
+    }
+
+    @Test
+    @DisplayName("source.ts_ms declared as int32 (Integer value) is still extracted")
+    void tsMs_integerValueAccepted() {
+        // Guards the `instanceof Number` check rather than `instanceof Long`: a source schema that
+        // declares ts_ms as int32 yields an Integer, which a Long-only check would silently drop.
+        Schema int32TsMsSource = SchemaBuilder.struct().optional()
+                .field("lsn", Schema.OPTIONAL_INT64_SCHEMA)
+                .field("ts_ms", Schema.OPTIONAL_INT32_SCHEMA)
+                .build();
+        Schema row = rowSchema(SchemaBuilder.int32().name("id"));
+        Schema env = SchemaBuilder.struct().name("server.db.orders.Envelope")
+                .field("op", Schema.STRING_SCHEMA)
+                .field("after", row)
+                .field("source", int32TsMsSource)
+                .build();
+        Struct after = new Struct(row).put("id", 1);
+        Struct source = new Struct(int32TsMsSource).put("lsn", 1L).put("ts_ms", 1000);
+        Struct envelope = new Struct(env)
+                .put("op", "c").put("after", after).put("source", source);
+
+        Record record = convert(envelope);
+
+        assertInstanceOf(Integer.class, source.get("ts_ms"));
+        assertEquals(new Date(1000L), record.getJsonMap().get("__ts_ms").getObject());
+    }
+
+    @Test
+    @DisplayName("missing source.ts_ms omits __ts_ms from both jsonMap and fields")
+    void tsMs_absentWhenSourceTsMsMissing() {
+        Schema row = rowSchema(SchemaBuilder.int32().name("id"));
+        Schema env = envelopeSchema(row);
+        Struct after = new Struct(row).put("id", 1);
+        Struct envelope = new Struct(env)
+                .put("op", "c").put("after", after)
+                .put("source", sourceStruct(sourceSchema(), 1L))
+                .put("ts_ms", PG_ENVELOPE_TS_MS);
+
+        Record record = convert(envelope);
+
+        // Absent, not null and not defaulted to the envelope ts_ms.
+        assertFalse(record.getJsonMap().containsKey("__ts_ms"));
+        for (Field f : record.getFields()) {
+            assertNotEquals("__ts_ms", f.name());
+        }
+    }
+
+    @Test
+    @DisplayName("null source struct omits __ts_ms and keeps _version at 0")
+    void tsMs_absentWhenSourceNull() {
+        Schema row = rowSchema(SchemaBuilder.int32().name("id"));
+        Schema env = envelopeSchema(row);
+        Struct after = new Struct(row).put("id", 1);
+        Struct envelope = new Struct(env)
+                .put("op", "c").put("after", after).put("source", null);
+
+        Record record = convert(envelope);
+
+        assertFalse(record.getJsonMap().containsKey("__ts_ms"));
+        assertEquals(BigInteger.ZERO, record.getJsonMap().get("_version").getObject());
+    }
+
+    @Test
+    @DisplayName("__ts_ms is not injected when debeziumCDCEnabled=false")
+    void tsMs_notInjectedWhenDisabled() {
+        Schema row = rowSchema(SchemaBuilder.int32().name("id"));
+        Schema env = envelopeSchema(row);
+        Struct after = new Struct(row).put("id", 1);
+        Struct envelope = new Struct(env)
+                .put("op", "c").put("after", after)
+                .put("source", sourceStruct(sourceSchema(), 1L, PG_SOURCE_TS_MS));
+
+        Record record = Record.convert(sinkRecord(envelope), false, "_", DATABASE, false);
+
+        assertEquals(SchemaType.SCHEMA, record.getSchemaType());
+        assertFalse(record.getJsonMap().containsKey("__ts_ms"));
     }
 }

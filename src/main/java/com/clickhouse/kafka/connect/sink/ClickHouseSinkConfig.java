@@ -677,9 +677,13 @@ public class ClickHouseSinkConfig {
                 false,
                 ConfigDef.Importance.MEDIUM,
                 "Enable Debezium CDC envelope processing. When true, records whose schema name ends with"
-                        + " '.Envelope' are routed through DebeziumRecordConvertor, which extracts op/before/after,"
-                        + " injects _version (from source.lsn / gtid / change_lsn) and is_deleted columns."
-                        + " Requires a ReplacingMergeTree(_version, is_deleted) target table. default: false",
+                        + " '.Envelope' are routed through DebeziumRecordConvertor, which extracts op/before/after"
+                        + " and injects the _version (from source.lsn / sequence / gtid / change_lsn), is_deleted and"
+                        + " __ts_ms columns. __ts_ms is source.ts_ms, the source database commit time, for end-to-end"
+                        + " latency measurement; declare it as DateTime64(3). Tables without a __ts_ms column are"
+                        + " unaffected — the value is dropped — but with auto.evolve=true the column is created"
+                        + " automatically. Requires a ReplacingMergeTree(_version, is_deleted) target table."
+                        + " default: false",
                 group,
                 ++orderInGroup,
                 ConfigDef.Width.SHORT,

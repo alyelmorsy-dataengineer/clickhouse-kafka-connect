@@ -1,3 +1,37 @@
+# 1.3.11
+
+## New Features
+
+* Debezium CDC envelope support, enabled with `debeziumCDCEnabled=true`. Records whose value schema name ends
+  with `.Envelope` are routed through `DebeziumRecordConvertor`, which flattens the envelope (`after` for
+  `op=c`/`r`/`u`, `before` for `op=d`) and injects three columns for a
+  `ReplacingMergeTree(_version, is_deleted)` target table:
+  * `_version` — the replication position: PostgreSQL `source.lsn`, PostgreSQL snapshot `source.sequence`,
+    MySQL `source.gtid` sequence number or `source.pos`, or the SQL Server composite
+    `(commit_lsn << 64) | change_lsn` as UInt128.
+  * `is_deleted` — `0` for upserts, `1` for deletes.
+  * `__ts_ms` — `source.ts_ms`, the commit time in the **source database**, so end-to-end pipeline latency
+    (source commit → ClickHouse) can be measured per row. This is deliberately not the envelope-level
+    `ts_ms`, which is when Debezium read the change and therefore excludes source-to-Debezium lag. Declare
+    the column as `DateTime64(3)`. Tables without a `__ts_ms` column are unaffected — the value is dropped
+    on both the RowBinary and JSON write paths — but with `auto.evolve=true` the column is created
+    automatically. The value comes from the record, not a wall clock, so batches stay byte-identical
+    across retries and remain compatible with `exactlyOnce=true` block deduplication.
+
+  `op=t` (truncate) is not supported and such records are skipped.
+
+## Bug Fixes
+
+* Debezium CDC: during a PostgreSQL snapshot (`op=r`) `source.lsn` is null, so `_version` fell back to `0`
+  and snapshot rows could never win a `ReplacingMergeTree` comparison. `source.sequence`
+  (`"[lastCommitLsn, lsn]"`) is now parsed and its last non-null element used; it is in the same address
+  space as streaming `source.lsn`, so a later streaming event still wins. Streaming `source.lsn` keeps
+  priority.
+* Int128/UInt128 columns now accept UUID-formatted hex, `0x`-prefixed hex, a leading `+`, and blank as
+  zero. A UUID string previously failed with `Illegal embedded sign character` from `BigInteger(String)`.
+  Conversion failures now throw a `DataException` naming the column and the offending value instead of a
+  bare `ClassCastException`/`NumberFormatException`.
+
 # 1.3.10, 2026-05-26
 
 ## Bug Fixes
