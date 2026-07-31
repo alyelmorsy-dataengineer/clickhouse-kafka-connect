@@ -243,6 +243,20 @@ public class ClickHouseTestHelpers {
         }
     }
 
+    public static int countRowsWhere(ClickHouseHelperClient chc, String tableName, String whereClause) {
+        optimizeTable(chc, tableName);
+        String from = buildFromClause(chc, tableName);
+        String queryCount = "SELECT COUNT(*) FROM " + from + " WHERE " + whereClause
+                + " SETTINGS select_sequential_consistency = 1";
+        try (Records records = chc.queryV2(queryCount)) {
+            String value = records.iterator().next().getString(1);
+            return Integer.parseInt(value);
+        } catch (Exception e) {
+            LOGGER.error("Error while counting rows. Query was " + queryCount, e);
+            throw new RuntimeException(e);
+        }
+    }
+
     public static int countRowsWithEmojis(ClickHouseHelperClient chc, String tableName) {
         optimizeTable(chc, tableName);
         String from = buildFromClause(chc, tableName);

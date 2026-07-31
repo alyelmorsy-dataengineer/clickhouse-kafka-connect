@@ -1958,6 +1958,114 @@ public class ClickHouseSinkTaskWithSchemaTest extends ClickHouseBase {
                 "Column 'new_float64_field' should exist");
     }
 
+    // ---- Debezium CDC auto.evolve helpers ----
+
+    private static final String DEBEZIUM_ENVELOPE_NAME = "server.db.customers.Envelope";
+
+    private static Schema debeziumSourceSchema() {
+        return SchemaBuilder.struct().optional()
+                .name("io.debezium.connector.postgresql.Source")
+                .field("lsn", Schema.OPTIONAL_INT64_SCHEMA)
+                .build();
+    }
+
+    private static Schema debeziumEnvelopeSchema(Schema rowSchema) {
+        return SchemaBuilder.struct().name(DEBEZIUM_ENVELOPE_NAME)
+                .field("op", Schema.STRING_SCHEMA)
+                .field("before", rowSchema)
+                .field("after", rowSchema)
+                .field("source", debeziumSourceSchema())
+                .build();
+    }
+
+    /** Builds a Debezium op=c (create) SinkRecord whose after struct is populated from afterValues. */
+    private static SinkRecord debeziumCreateRecord(String topic, Schema rowSchema, long lsn, long offset,
+                                                   Map<String, Object> afterValues) {
+        Struct after = new Struct(rowSchema);
+        afterValues.forEach(after::put);
+        Schema envelopeSchema = debeziumEnvelopeSchema(rowSchema);
+        Struct source = new Struct(debeziumSourceSchema()).put("lsn", lsn);
+        Struct envelope = new Struct(envelopeSchema)
+                .put("op", "c")
+                .put("after", after)
+                .put("source", source);
+        return new SinkRecord(topic, 0, null, null, envelopeSchema, envelope, offset);
+    }
+
+    @Test
+    public void autoEvolveAddsColumnForDebeziumCDC() {
+        Assumptions.assumeFalse(isCluster, "Test is disabled against cluster until issue #738 is resolved");
+        Map<String, String> props = getBaseProps();
+        props.put(ClickHouseSinkConfig.AUTO_EVOLVE, "true");
+        props.put(ClickHouseSinkConfig.DEBEZIUM_CDC_ENABLED, "true");
+        ClickHouseHelperClient chc = ClickHouseTestHelpers.createClient(props);
+
+        String topic = "auto_evolve_debezium_test";
+        ClickHouseTestHelpers.dropTable(chc, topic);
+        // Target table matches the V1 Debezium row plus the synthetic CDC columns.
+        new CreateTableStatement()
+                .column("id", "Int32")
+                .column("name", "String")
+                .column("_version", "UInt64")
+                .column("is_deleted", "UInt8")
+                .engine("ReplacingMergeTree(_version, is_deleted)")
+                .orderByColumn("id")
+                .tableName(topic)
+                .execute(chc);
+
+        // V1 schema: id, name
+        Schema rowV1 = SchemaBuilder.struct()
+                .field("id", Schema.INT32_SCHEMA)
+                .field("name", Schema.STRING_SCHEMA)
+                .build();
+
+        ClickHouseSinkTask chst = new ClickHouseSinkTask();
+        chst.start(props);
+
+        List<SinkRecord> v1 = new ArrayList<>();
+        for (int i = 1; i <= 10; i++) {
+            Map<String, Object> after = new HashMap<>();
+            after.put("id", i);
+            after.put("name", "name-" + i);
+            v1.add(debeziumCreateRecord(topic, rowV1, 100L + i, i, after));
+        }
+        chst.put(v1);
+        assertEquals(10, ClickHouseTestHelpers.countRows(chc, topic));
+        assertFalse(chc.describeTable(chc.getDatabase(), topic).getRootColumnsMap().containsKey("email"),
+                "'email' column must not exist before the evolved records are inserted");
+
+        // V2 schema: adds a new nullable 'email' field in the Debezium after struct
+        Schema rowV2 = SchemaBuilder.struct()
+                .field("id", Schema.INT32_SCHEMA)
+                .field("name", Schema.STRING_SCHEMA)
+                .field("email", Schema.OPTIONAL_STRING_SCHEMA)
+                .build();
+
+        List<SinkRecord> v2 = new ArrayList<>();
+        for (int i = 11; i <= 20; i++) {
+            Map<String, Object> after = new HashMap<>();
+            after.put("id", i);
+            after.put("name", "name-" + i);
+            after.put("email", "user" + i + "@example.com");
+            v2.add(debeziumCreateRecord(topic, rowV2, 100L + i, i, after));
+        }
+        chst.put(v2);
+        chst.stop();
+
+        assertEquals(20, ClickHouseTestHelpers.countRows(chc, topic));
+
+        // auto.evolve must have issued ALTER TABLE ... ADD COLUMN email for the new Debezium field.
+        com.clickhouse.kafka.connect.sink.db.mapping.Table described =
+                chc.describeTable(chc.getDatabase(), topic);
+        assertTrue(described.getRootColumnsMap().containsKey("email"),
+                "New column 'email' should have been added by auto.evolve on the Debezium CDC path");
+
+        // And the value for a V2 record must have actually landed in the new column.
+        assertEquals(1, ClickHouseTestHelpers.countRowsWhere(chc, topic,
+                "id = 15 AND email = 'user15@example.com'"),
+                "The evolved 'email' value should be readable back for a V2 record");
+    }
+
     @Test
     public void autoEvolveCachesSchemaAfterDDL() {
         Assumptions.assumeFalse(isCluster, "Test is disabled against cluster until issue #738 is resolved");
