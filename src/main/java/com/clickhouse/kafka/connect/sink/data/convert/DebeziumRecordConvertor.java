@@ -54,6 +54,7 @@ public class DebeziumRecordConvertor extends RecordConvertor {
     private static final String FIELD_AFTER  = "after";
     private static final String FIELD_SOURCE = "source";
     private static final String FIELD_LSN        = "lsn";
+    private static final String FIELD_SEQUENCE   = "sequence";     // PostgreSQL snapshot: "[lastCommitLsn, lsn]"
     private static final String FIELD_GTID       = "gtid";
     private static final String FIELD_POS        = "pos";
     private static final String FIELD_CHANGE_LSN  = "change_lsn";   // SQL Server streaming
@@ -207,6 +208,29 @@ public class DebeziumRecordConvertor extends RecordConvertor {
         }
     }
 
+    /**
+     * Parses a PostgreSQL Debezium {@code source.sequence} string, e.g. {@code ["11793116936608","11793116937360"]},
+     * and returns the last non-null element as a BigInteger. This is the read-position LSN (same address space as
+     * streaming {@code source.lsn}). Returns null if no numeric element is present.
+     */
+    private static BigInteger parseSequenceLsn(String sequence) {
+        String trimmed = sequence.trim();
+        if (trimmed.length() < 2 || trimmed.charAt(0) != '[') return null;
+        // Strip brackets, split on commas, walk from the end for the last numeric (non-null) token.
+        String inner = trimmed.substring(1, trimmed.lastIndexOf(']') < 0 ? trimmed.length() : trimmed.lastIndexOf(']'));
+        String[] parts = inner.split(",");
+        for (int i = parts.length - 1; i >= 0; i--) {
+            String token = parts[i].trim().replace("\"", "");
+            if (token.isEmpty() || token.equalsIgnoreCase("null")) continue;
+            try {
+                return new BigInteger(token);
+            } catch (NumberFormatException nfe) {
+                return null;
+            }
+        }
+        return null;
+    }
+
     private static long packSqlServerLsn(String lsn) {
         String[] parts = lsn.split(":");
         if (parts.length != 3) return 0L;
@@ -230,12 +254,26 @@ public class DebeziumRecordConvertor extends RecordConvertor {
         Struct source = envelope.getStruct(FIELD_SOURCE);
         if (source == null) return BigInteger.ZERO;
 
-        // PostgreSQL: lsn is a Long
+        // PostgreSQL streaming: lsn is a Long
         try {
             Object lsn = source.get(FIELD_LSN);
             if (lsn instanceof Number) return BigInteger.valueOf(((Number) lsn).longValue());
         } catch (Exception e) {
             LOGGER.debug("Could not read source.lsn — not a PostgreSQL source or field absent: {}", e.getMessage());
+        }
+
+        // PostgreSQL snapshot (op=r): source.lsn is null, but source.sequence carries the LSN.
+        // Debezium's SourceInfo.sequence() emits "[lastCommitLsn, lsn]" — both are Lsn.asLong()
+        // values in the same address space as streaming source.lsn, so they are directly comparable.
+        // Take the last non-null element (the read-position lsn) so a later streaming event always wins.
+        try {
+            Object sequence = source.get(FIELD_SEQUENCE);
+            if (sequence instanceof String) {
+                BigInteger seqVersion = parseSequenceLsn((String) sequence);
+                if (seqVersion != null) return seqVersion;
+            }
+        } catch (Exception e) {
+            LOGGER.debug("Could not parse source.sequence: {}", e.getMessage());
         }
 
         // MySQL: gtid = "uuid:N" — extract the sequence number N

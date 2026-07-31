@@ -43,6 +43,7 @@ public class DebeziumRecordConvertorTest {
     private static Schema sourceSchema() {
         return SchemaBuilder.struct().optional()
                 .field("lsn", Schema.OPTIONAL_INT64_SCHEMA)
+                .field("sequence", Schema.OPTIONAL_STRING_SCHEMA)
                 .field("gtid", Schema.OPTIONAL_STRING_SCHEMA)
                 .field("pos", Schema.OPTIONAL_INT64_SCHEMA)
                 .field("change_lsn", Schema.OPTIONAL_STRING_SCHEMA)
@@ -197,6 +198,63 @@ public class DebeziumRecordConvertorTest {
         Record record = convert(envelope);
 
         assertEquals(BigInteger.valueOf(12345L), record.getJsonMap().get("_version").getObject());
+    }
+
+    @Test
+    @DisplayName("PostgreSQL snapshot (lsn null) uses last element of source.sequence as _version")
+    void version_postgresSnapshotSequence() {
+        Schema row = rowSchema(SchemaBuilder.int32().name("id"));
+        Schema env = envelopeSchema(row);
+        Struct after = new Struct(row).put("id", 1);
+        Struct source = new Struct(sourceSchema())
+                .put("lsn", null)
+                .put("sequence", "[\"11793116936608\",\"11793116937360\"]");
+        Struct envelope = new Struct(env)
+                .put("op", "r")
+                .put("after", after)
+                .put("source", source);
+
+        Record record = convert(envelope);
+
+        assertEquals(BigInteger.valueOf(11793116937360L), record.getJsonMap().get("_version").getObject());
+    }
+
+    @Test
+    @DisplayName("PostgreSQL streaming lsn takes priority over source.sequence")
+    void version_postgresLsnPreferredOverSequence() {
+        Schema row = rowSchema(SchemaBuilder.int32().name("id"));
+        Schema env = envelopeSchema(row);
+        Struct after = new Struct(row).put("id", 1);
+        Struct source = new Struct(sourceSchema())
+                .put("lsn", 99999L)
+                .put("sequence", "[\"11793116936608\",\"11793116937360\"]");
+        Struct envelope = new Struct(env)
+                .put("op", "u")
+                .put("after", after)
+                .put("source", source);
+
+        Record record = convert(envelope);
+
+        assertEquals(BigInteger.valueOf(99999L), record.getJsonMap().get("_version").getObject());
+    }
+
+    @Test
+    @DisplayName("source.sequence with null lastCommitLsn falls back to the read-position lsn")
+    void version_postgresSequenceNullFirstElement() {
+        Schema row = rowSchema(SchemaBuilder.int32().name("id"));
+        Schema env = envelopeSchema(row);
+        Struct after = new Struct(row).put("id", 1);
+        Struct source = new Struct(sourceSchema())
+                .put("lsn", null)
+                .put("sequence", "[null,\"11793116937360\"]");
+        Struct envelope = new Struct(env)
+                .put("op", "r")
+                .put("after", after)
+                .put("source", source);
+
+        Record record = convert(envelope);
+
+        assertEquals(BigInteger.valueOf(11793116937360L), record.getJsonMap().get("_version").getObject());
     }
 
     @Test

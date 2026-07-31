@@ -22,6 +22,7 @@ import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.json.JSONObject;
 import org.junit.jupiter.api.Assertions;
@@ -387,5 +388,70 @@ public class ClickHouseWriterTest extends ClickHouseBase {
             t = t.getCause();
         }
         return false;
+    }
+
+    private static Column uint128Column() {
+        return Column.extractColumn("transaction_id", "UInt128", false, false, false);
+    }
+
+    @Test
+    public void toBigInteger_plainDecimalString() {
+        Column col = uint128Column();
+        Assertions.assertEquals(
+                new java.math.BigInteger("326240237887098094772038105612387528758"),
+                ClickHouseWriter.toBigInteger("326240237887098094772038105612387528758", col));
+    }
+
+    @Test
+    public void toBigInteger_bigIntegerPassThrough() {
+        Column col = uint128Column();
+        java.math.BigInteger bi = new java.math.BigInteger("12345678901234567890");
+        Assertions.assertSame(bi, ClickHouseWriter.toBigInteger(bi, col));
+    }
+
+    @Test
+    public void toBigInteger_numberValue() {
+        Column col = uint128Column();
+        Assertions.assertEquals(
+                java.math.BigInteger.valueOf(42L), ClickHouseWriter.toBigInteger(42L, col));
+    }
+
+    @Test
+    public void toBigInteger_leadingPlusStripped() {
+        Column col = uint128Column();
+        Assertions.assertEquals(
+                new java.math.BigInteger("100"), ClickHouseWriter.toBigInteger("+100", col));
+    }
+
+    @Test
+    public void toBigInteger_uuidStringParsedAsHex() {
+        Column col = uint128Column();
+        String uuid = "00005ec8-2754-4d99-8ae9-0b80afeb4792";
+        Assertions.assertEquals(
+                new java.math.BigInteger(uuid.replace("-", ""), 16),
+                ClickHouseWriter.toBigInteger(uuid, col));
+    }
+
+    @Test
+    public void toBigInteger_hexPrefixParsed() {
+        Column col = uint128Column();
+        Assertions.assertEquals(
+                new java.math.BigInteger("ff", 16), ClickHouseWriter.toBigInteger("0xff", col));
+    }
+
+    @Test
+    public void toBigInteger_emptyStringIsZero() {
+        Column col = uint128Column();
+        Assertions.assertEquals(
+                java.math.BigInteger.ZERO, ClickHouseWriter.toBigInteger("   ", col));
+    }
+
+    @Test
+    public void toBigInteger_invalidValueThrowsWithColumnAndValue() {
+        Column col = uint128Column();
+        DataException ex = Assertions.assertThrows(
+                DataException.class, () -> ClickHouseWriter.toBigInteger("not-a-number!!", col));
+        Assertions.assertTrue(ex.getMessage().contains("transaction_id"));
+        Assertions.assertTrue(ex.getMessage().contains("not-a-number!!"));
     }
 }

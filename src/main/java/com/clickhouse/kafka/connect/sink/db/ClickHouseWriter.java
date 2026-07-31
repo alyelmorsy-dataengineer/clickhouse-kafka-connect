@@ -792,16 +792,51 @@ public class ClickHouseWriter implements DBWriter {
                     BinaryStreamUtils.writeEnum16(stream, col.convertEnumValues((String) value).intValue());
                     break;
                 case INT128:
-                    BinaryStreamUtils.writeInt128(stream, value instanceof java.math.BigInteger
-                            ? (java.math.BigInteger) value
-                            : new java.math.BigInteger(value.toString()));
+                    BinaryStreamUtils.writeInt128(stream, toBigInteger(value, col));
                     break;
                 case UINT128:
-                    BinaryStreamUtils.writeUnsignedInt128(stream, value instanceof java.math.BigInteger
-                            ? (java.math.BigInteger) value
-                            : new java.math.BigInteger(value.toString()));
+                    BinaryStreamUtils.writeUnsignedInt128(stream, toBigInteger(value, col));
                     break;
             }
+        }
+    }
+
+    /**
+     * Coerces a value destined for an Int128/UInt128 column into a BigInteger. Accepts:
+     * BigInteger and Number directly; decimal digit strings (with optional leading '+'/'-');
+     * 0x-prefixed and UUID-formatted (hyphenated) hex strings. A UUID string parsed as a plain
+     * BigInteger throws "Illegal embedded sign character" because of the internal hyphens, so those
+     * are handled explicitly. On failure the column name and raw value are included for diagnosis.
+     */
+    static java.math.BigInteger toBigInteger(Object value, Column col) {
+        if (value instanceof java.math.BigInteger) {
+            return (java.math.BigInteger) value;
+        }
+        if (value instanceof Number) {
+            return java.math.BigInteger.valueOf(((Number) value).longValue());
+        }
+        String s = value.toString().trim();
+        try {
+            if (s.isEmpty()) {
+                return java.math.BigInteger.ZERO;
+            }
+            // UUID form (e.g. "00005ec8-2754-4d99-8ae9-0b80afeb4792") → 128-bit hex without hyphens.
+            if (s.indexOf('-', 1) > 0 && s.length() >= 32) {
+                return new java.math.BigInteger(s.replace("-", ""), 16);
+            }
+            // Explicit hex prefix.
+            if (s.startsWith("0x") || s.startsWith("0X")) {
+                return new java.math.BigInteger(s.substring(2), 16);
+            }
+            // Leading '+' is not accepted by BigInteger(String) in all JDKs — strip it.
+            if (s.charAt(0) == '+') {
+                s = s.substring(1);
+            }
+            return new java.math.BigInteger(s);
+        } catch (NumberFormatException e) {
+            throw new DataException(String.format(
+                    "Cannot convert value [%s] to %s for column [%s]",
+                    value, col.getType(), col.getName()), e);
         }
     }
 
