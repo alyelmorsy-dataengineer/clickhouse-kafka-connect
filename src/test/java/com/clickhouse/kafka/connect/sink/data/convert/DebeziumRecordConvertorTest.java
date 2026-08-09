@@ -293,7 +293,7 @@ public class DebeziumRecordConvertorTest {
     }
 
     @Test
-    @DisplayName("SQL Server change_lsn is bit-packed into _version")
+    @DisplayName("SQL Server change_lsn is losslessly packed into _version")
     void version_sqlServerChangeLsn() {
         Schema sourceWithChangeLsn = SchemaBuilder.struct().optional()
                 .field("commit_lsn", Schema.OPTIONAL_STRING_SCHEMA)
@@ -317,9 +317,9 @@ public class DebeziumRecordConvertorTest {
 
         Record record = convert(envelope);
 
-        // commit_lsn absent → commitPacked=0; change_lsn packed into low 64 bits
-        long changePacked = (1L << 48) | (2L << 16) | 3L;
-        BigInteger expected = BigInteger.ZERO.shiftLeft(64).or(BigInteger.valueOf(changePacked));
+        // commit_lsn absent → commitPacked=0; change_lsn packed into low 80 bits
+        BigInteger changePacked = new BigInteger("00000001" + "00000002" + "0003", 16);
+        BigInteger expected = BigInteger.ZERO.shiftLeft(80).or(changePacked);
         assertEquals(expected, record.getJsonMap().get("_version").getObject());
     }
 
@@ -348,9 +348,9 @@ public class DebeziumRecordConvertorTest {
 
         Record record = convert(envelope);
 
-        // commit_lsn="0000006f:00000ab7:0003" packed into high 64 bits; change_lsn=null → 0 in low 64 bits
-        long commitPacked = (0x6fL << 48) | (0xab7L << 16) | 0x03L;
-        BigInteger expected = BigInteger.valueOf(commitPacked).shiftLeft(64);
+        // commit_lsn="0000006f:00000ab7:0003" packed into high 80 bits; change_lsn=null → 0 in low 80 bits
+        BigInteger commitPacked = new BigInteger("0000006f" + "00000ab7" + "0003", 16);
+        BigInteger expected = commitPacked.shiftLeft(80);
         assertEquals(expected, record.getJsonMap().get("_version").getObject());
     }
 
@@ -360,7 +360,8 @@ public class DebeziumRecordConvertorTest {
         // Real data: two updates in the same transaction. The later one (slot 0x0103 = 259)
         // is the true last write and must version-sort ABOVE the earlier one (slot 0x00eb = 235).
         // Under the old 8-bit slot mask, 0x0103 & 0xFF == 0x03, which sorted BELOW 0x00eb —
-        // ReplacingMergeTree would then keep the earlier row's data as "latest".
+        // ReplacingMergeTree would then keep the earlier row's data as "latest". Now that every
+        // LSN component is packed losslessly, no slot number can ever overflow its budget again.
         Schema sqlServerSource = SchemaBuilder.struct().optional()
                 .field("commit_lsn", Schema.OPTIONAL_STRING_SCHEMA)
                 .field("change_lsn", Schema.OPTIONAL_STRING_SCHEMA)
@@ -391,20 +392,59 @@ public class DebeziumRecordConvertorTest {
         assertTrue(laterVersion.compareTo(earlierVersion) > 0,
                 "change_lsn slot 0x0103 (259) must version-sort above slot 0x00eb (235)");
 
-        long commitPacked = (0x94a8L << 48) | (0x000b53bbL << 16) | 0x000aL;
-        long changePacked = (0x94a8L << 48) | (0x000b4c4dL << 16) | 0x0103L;
-        BigInteger expected = BigInteger.valueOf(commitPacked).and(BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE)).shiftLeft(64)
-                .or(BigInteger.valueOf(changePacked).and(BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE)));
+        BigInteger commitPacked = new BigInteger("000894a8" + "000b53bb" + "000a", 16);
+        BigInteger changePacked = new BigInteger("000894a8" + "000b4c4d" + "0103", 16);
+        BigInteger expected = commitPacked.shiftLeft(80).or(changePacked);
         assertEquals(expected, laterVersion);
     }
 
     @Test
-    @DisplayName("SQL Server commit_lsn with masked top bit set stays a positive composite (regression)")
+    @DisplayName("SQL Server LSN components are parsed positionally, not by hex text concatenation (regression)")
+    void version_sqlServerLsn_zeroPaddingDoesNotChangeValue() {
+        // Debezium zero-pads LSN components to 8:8:4, but the value must come from each
+        // component's numeric position, not from gluing the hex text together. Concatenation
+        // makes "894a8:b4c4d:103" and "000894a8:000b4c4d:0103" — the same LSN — parse to values
+        // ~65000x apart, silently destroying version ordering instead of failing loudly.
+        Schema sqlServerSource = SchemaBuilder.struct().optional()
+                .field("commit_lsn", Schema.OPTIONAL_STRING_SCHEMA)
+                .field("change_lsn", Schema.OPTIONAL_STRING_SCHEMA)
+                .build();
+        Schema row = rowSchema(SchemaBuilder.int32().name("id"));
+        Schema env = SchemaBuilder.struct().name("server.db.orders.Envelope")
+                .field("op", Schema.STRING_SCHEMA)
+                .field("before", row)
+                .field("after", row)
+                .field("source", sqlServerSource)
+                .build();
+        Struct after = new Struct(row).put("id", 1);
+
+        Struct padded = new Struct(sqlServerSource)
+                .put("commit_lsn", "000894a8:000b53bb:000a")
+                .put("change_lsn", "000894a8:000b4c4d:0103");
+        Struct unpadded = new Struct(sqlServerSource)
+                .put("commit_lsn", "894a8:b53bb:a")
+                .put("change_lsn", "894a8:b4c4d:103");
+
+        BigInteger paddedVersion = (BigInteger) convert(new Struct(env)
+                .put("op", "u").put("after", after).put("source", padded))
+                .getJsonMap().get("_version").getObject();
+        BigInteger unpaddedVersion = (BigInteger) convert(new Struct(env)
+                .put("op", "u").put("after", after).put("source", unpadded))
+                .getJsonMap().get("_version").getObject();
+
+        assertEquals(paddedVersion, unpaddedVersion,
+                "the same LSN must produce the same version regardless of zero-padding");
+    }
+
+    @Test
+    @DisplayName("SQL Server commit_lsn with a high-bit-set component stays a positive composite (regression)")
     void version_sqlServerCommitLsn_topBitSetStaysPositive() {
-        // VLF sequence number 0xffff has its masked-field top bit set. Before this fix,
+        // VLF sequence number 0xffff has its top bit set. Under the old long-based packing,
         // BigInteger.valueOf(commitPacked) on a long with bit 63 set is NEGATIVE, and
-        // shiftLeft(64) preserved that sign — corrupting the composite into a negative
+        // shiftLeft(...) preserved that sign — corrupting the composite into a negative
         // (i.e. lowest-possible-sorting) version despite representing a huge, valid LSN.
+        // Parsing straight from a hex digit string is always non-negative, structurally
+        // ruling this out — this test pins that guarantee end-to-end.
         Schema sqlServerSource = SchemaBuilder.struct().optional()
                 .field("commit_lsn", Schema.OPTIONAL_STRING_SCHEMA)
                 .field("change_lsn", Schema.OPTIONAL_STRING_SCHEMA)
@@ -426,9 +466,8 @@ public class DebeziumRecordConvertorTest {
 
         assertTrue(version.signum() > 0, "composite version must be positive, not corrupted by sign extension");
 
-        long commitPacked = (0xffffL << 48) | (0x00000001L << 16) | 0x0001L;
-        BigInteger expected = BigInteger.valueOf(commitPacked)
-                .and(BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE)).shiftLeft(64);
+        BigInteger commitPacked = new BigInteger("0000ffff" + "00000001" + "0001", 16);
+        BigInteger expected = commitPacked.shiftLeft(80);
         assertEquals(expected, version);
     }
 

@@ -495,11 +495,13 @@ public class ClickHouseWriter implements DBWriter {
                 case INT32:
                 case INT64:
                 case INT128:
+                case INT256:
                 case UINT8:
                 case UINT16:
                 case UINT32:
                 case UINT64:
                 case UINT128:
+                case UINT256:
                 case FLOAT32:
                 case FLOAT64:
                 case BOOLEAN:
@@ -797,12 +799,18 @@ public class ClickHouseWriter implements DBWriter {
                 case UINT128:
                     BinaryStreamUtils.writeUnsignedInt128(stream, toBigInteger(value, col));
                     break;
+                case INT256:
+                    BinaryStreamUtils.writeInt256(stream, toBigInteger(value, col));
+                    break;
+                case UINT256:
+                    BinaryStreamUtils.writeUnsignedInt256(stream, toBigInteger(value, col));
+                    break;
             }
         }
     }
 
     /**
-     * Coerces a value destined for an Int128/UInt128 column into a BigInteger. Accepts:
+     * Coerces a value destined for an Int128/UInt128/Int256/UInt256 column into a BigInteger. Accepts:
      * BigInteger and Number directly; decimal digit strings (with optional leading '+'/'-');
      * 0x-prefixed and UUID-formatted (hyphenated) hex strings. A UUID string parsed as a plain
      * BigInteger throws "Illegal embedded sign character" because of the internal hyphens, so those

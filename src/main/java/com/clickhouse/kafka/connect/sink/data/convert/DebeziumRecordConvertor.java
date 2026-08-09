@@ -33,7 +33,9 @@ import java.util.Map;
  *   op = "t"             → skip (truncate not supported)
  *
  * Injected columns:
- *   _version   UInt64       — source.lsn (PostgreSQL) or parsed source.gtid (MySQL)
+ *   _version   UInt64 (PostgreSQL lsn / sequence, MySQL gtid / pos) or UInt256
+ *              (SQL Server: (commit_lsn << 80) | change_lsn, each LSN packed losslessly —
+ *              see extractVersion() and packSqlServerLsn())
  *   is_deleted UInt8        — 0 for upserts, 1 for deletes
  *   __ts_ms    DateTime64(3) — source.ts_ms, the commit time in the source database.
  *                             Enables end-to-end latency measurement (source commit → ClickHouse).
@@ -251,22 +253,33 @@ public class DebeziumRecordConvertor extends RecordConvertor {
         return null;
     }
 
+    // SQL Server's LSN is a fixed 10-byte (80-bit) value: 4-byte VLF sequence number +
+    // 4-byte log block ID + 2-byte slot number. A UInt256 _version column gives two of these
+    // (commit_lsn and change_lsn) 128 bits of headroom each — comfortably more than the 80 any
+    // single LSN needs — so every component is packed losslessly, with nothing to truncate.
+    private static final int SQLSERVER_LSN_BITS = 80;
+    private static final int SQLSERVER_LSN_BLOCK_SHIFT = 16;  // slot number occupies bits 0-15
+    private static final int SQLSERVER_LSN_VLF_SHIFT   = 48;  // log block ID occupies bits 16-47
+
     /**
-     * SQL Server's true LSN is 80 bits (32+32+16), which doesn't fit in a 64-bit long, so one
-     * field must be trimmed. The VLF sequence number (component 1) only increments when a new
-     * virtual log file is created, so 65536 (16 bits) is safe for any realistic deployment
-     * lifetime. The slot number (component 3) gets the full 16 bits real values need — slot
-     * numbers routinely exceed 255 within a single busy log block, and an 8-bit mask there
-     * previously truncated them, corrupting version ordering for transactions with >255 row
-     * changes (e.g. change_lsn slot 0x0103 collapsed to 0x03, sorting below slot 0x00eb).
+     * Parses a SQL Server LSN ("00000027:00000ac8:0003") into its true 80-bit value by shifting
+     * each component into its own field width. Every component keeps full precision, so unlike a
+     * fixed-mask packing no field can overflow its budget.
+     *
+     * Each component is parsed as a number rather than concatenating the hex text: Debezium always
+     * zero-pads to 8:8:4, but text concatenation silently yields a completely different value for
+     * the same LSN if that padding ever varies, which would corrupt version ordering rather than
+     * fail loudly.
      */
-    private static long packSqlServerLsn(String lsn) {
+    private static BigInteger packSqlServerLsn(String lsn) {
         String[] parts = lsn.split(":");
-        if (parts.length != 3) return 0L;
-        long p1 = Long.parseLong(parts[0].trim(), 16) & 0xFFFFL;       // 16 bits
-        long p2 = Long.parseLong(parts[1].trim(), 16) & 0xFFFFFFFFL;   // 32 bits
-        long p3 = Long.parseLong(parts[2].trim(), 16) & 0xFFFFL;       // 16 bits
-        return (p1 << 48) | (p2 << 16) | p3;
+        if (parts.length != 3) return BigInteger.ZERO;
+        BigInteger vlf   = new BigInteger(parts[0].trim(), 16);
+        BigInteger block = new BigInteger(parts[1].trim(), 16);
+        BigInteger slot  = new BigInteger(parts[2].trim(), 16);
+        return vlf.shiftLeft(SQLSERVER_LSN_VLF_SHIFT)
+                .or(block.shiftLeft(SQLSERVER_LSN_BLOCK_SHIFT))
+                .or(slot);
     }
 
     private static String bytesToHex(byte[] bytes) {
@@ -361,7 +374,7 @@ public class DebeziumRecordConvertor extends RecordConvertor {
         // commit_lsn is always present; change_lsn is null during snapshot (op=r).
         // Higher commit_lsn always wins; within same commit, higher change_lsn wins.
         try {
-            long commitPacked = 0L;
+            BigInteger commitPacked = BigInteger.ZERO;
             boolean hasCommit = false;
             Object commitLsn = source.get(FIELD_COMMIT_LSN);
             if (commitLsn instanceof String) {
@@ -369,7 +382,7 @@ public class DebeziumRecordConvertor extends RecordConvertor {
                 hasCommit = true;
             }
 
-            long changePacked = 0L;
+            BigInteger changePacked = BigInteger.ZERO;
             boolean hasChange = false;
             Object changeLsn = source.get(FIELD_CHANGE_LSN);
             if (changeLsn instanceof String) {
@@ -378,15 +391,9 @@ public class DebeziumRecordConvertor extends RecordConvertor {
             }
 
             if (hasCommit || hasChange) {
-                // packSqlServerLsn's top bit (bit 63, the VLF sequence number's MSB) is set
-                // whenever that field is >= 0x8000, which happens routinely — mask both halves
-                // to unsigned before combining, or a set top bit makes commitPacked/changePacked
-                // read as a negative long and corrupts the composite (and the presence check
-                // above, hence hasCommit/hasChange instead of a signed "> 0" comparison).
-                BigInteger unsignedMask64 = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE);
-                BigInteger high = BigInteger.valueOf(commitPacked).and(unsignedMask64).shiftLeft(64);
-                BigInteger low  = BigInteger.valueOf(changePacked).and(unsignedMask64);
-                return high.or(low);
+                // Both halves are non-negative by construction (parsed from hex digit strings),
+                // so this composite — up to 160 bits — needs a UInt256 _version column.
+                return commitPacked.shiftLeft(SQLSERVER_LSN_BITS).or(changePacked);
             }
         } catch (Exception e) {
             LOGGER.debug("Could not parse SQL Server LSN fields: {}", e.getMessage());

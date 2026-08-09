@@ -4,6 +4,7 @@ import com.clickhouse.data.ClickHouseDataUpdater;
 import com.clickhouse.data.ClickHouseInputStream;
 import com.clickhouse.data.ClickHouseOutputStream;
 import com.clickhouse.data.ClickHousePipedOutputStream;
+import com.clickhouse.data.format.BinaryStreamUtils;
 import com.clickhouse.kafka.connect.ClickHouseSinkConnector;
 import com.clickhouse.kafka.connect.sink.ClickHouseBase;
 import com.clickhouse.kafka.connect.sink.ClickHouseSinkConfig;
@@ -34,7 +35,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -115,6 +118,25 @@ public class ClickHouseWriterTest extends ClickHouseBase {
         writer.doWritePrimitive(Type.STRING, Schema.Type.STRING, out,"שלום", column);
         byte[] newBytes = out.toString().getBytes(StandardCharsets.UTF_8);
         assertTrue(Arrays.equals(originalBytes, Arrays.copyOfRange(newBytes, 1, newBytes.length)));//We add a length before the string
+    }
+
+    @Test
+    public void writeUnsignedInt256Primitive() throws IOException {
+        // Regression coverage for the UInt128->UInt256 _version widening (SQL Server CDC): a
+        // 160-bit composite ((commit_lsn << 80) | change_lsn) previously had no write path at
+        // all — UINT256 was missing from doWriteColValue's dispatch switch, so a column of this
+        // type silently wrote zero bytes and corrupted every subsequent column in the row.
+        ClickHouseWriter writer = new ClickHouseWriter(new SinkTaskStatistics(0));
+        Column column = Column.extractColumn("_version", "UInt256", false, false, false);
+        BigInteger version = new BigInteger("000894a8000b53bb000a000894a8000b4c4d0103", 16);
+
+        ByteArrayOutputStream actual = new ByteArrayOutputStream();
+        writer.doWritePrimitive(Type.UINT256, Schema.Type.BYTES, actual, version, column);
+
+        ByteArrayOutputStream expected = new ByteArrayOutputStream();
+        BinaryStreamUtils.writeUnsignedInt256(expected, version);
+
+        assertArrayEquals(expected.toByteArray(), actual.toByteArray());
     }
 
     private void runWithWriter(Map<String, String> props, Consumer<ClickHouseWriter> test) {
