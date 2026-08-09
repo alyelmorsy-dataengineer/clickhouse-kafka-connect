@@ -324,7 +324,11 @@ public class DebeziumRecordConvertor extends RecordConvertor {
 
     /**
      * Extracts the replication position from the Debezium source struct.
-     * Priority: PostgreSQL LSN → MySQL GTID sequence number → MySQL binlog pos.
+     * Priority: PostgreSQL LSN → PostgreSQL snapshot sequence → MySQL GTID sequence number →
+     * MySQL binlog pos → SQL Server (commit_lsn, change_lsn) composite.
+     *
+     * PostgreSQL/MySQL positions fit a UInt64 _version column; the SQL Server composite is up to
+     * 160 bits and requires UInt256.
      */
     private BigInteger extractVersion(Struct source) {
         if (source == null) return BigInteger.ZERO;
@@ -370,7 +374,7 @@ public class DebeziumRecordConvertor extends RecordConvertor {
             LOGGER.debug("Could not read source.pos — not a MySQL source or field absent: {}", e.getMessage());
         }
 
-        // SQL Server: composite version = (commit_lsn << 64) | change_lsn
+        // SQL Server: composite version = (commit_lsn << 80) | change_lsn
         // commit_lsn is always present; change_lsn is null during snapshot (op=r).
         // Higher commit_lsn always wins; within same commit, higher change_lsn wins.
         try {
