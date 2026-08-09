@@ -318,7 +318,7 @@ public class DebeziumRecordConvertorTest {
         Record record = convert(envelope);
 
         // commit_lsn absent → commitPacked=0; change_lsn packed into low 64 bits
-        long changePacked = (1L << 40) | (2L << 8) | 3L;
+        long changePacked = (1L << 48) | (2L << 16) | 3L;
         BigInteger expected = BigInteger.ZERO.shiftLeft(64).or(BigInteger.valueOf(changePacked));
         assertEquals(expected, record.getJsonMap().get("_version").getObject());
     }
@@ -349,9 +349,87 @@ public class DebeziumRecordConvertorTest {
         Record record = convert(envelope);
 
         // commit_lsn="0000006f:00000ab7:0003" packed into high 64 bits; change_lsn=null → 0 in low 64 bits
-        long commitPacked = (0x6fL << 40) | (0xab7L << 8) | 0x03L;
+        long commitPacked = (0x6fL << 48) | (0xab7L << 16) | 0x03L;
         BigInteger expected = BigInteger.valueOf(commitPacked).shiftLeft(64);
         assertEquals(expected, record.getJsonMap().get("_version").getObject());
+    }
+
+    @Test
+    @DisplayName("SQL Server change_lsn slot number > 255 must not be truncated (regression)")
+    void version_sqlServerChangeLsn_slotNumberAbove255NotTruncated() {
+        // Real data: two updates in the same transaction. The later one (slot 0x0103 = 259)
+        // is the true last write and must version-sort ABOVE the earlier one (slot 0x00eb = 235).
+        // Under the old 8-bit slot mask, 0x0103 & 0xFF == 0x03, which sorted BELOW 0x00eb —
+        // ReplacingMergeTree would then keep the earlier row's data as "latest".
+        Schema sqlServerSource = SchemaBuilder.struct().optional()
+                .field("commit_lsn", Schema.OPTIONAL_STRING_SCHEMA)
+                .field("change_lsn", Schema.OPTIONAL_STRING_SCHEMA)
+                .build();
+        Schema row = rowSchema(SchemaBuilder.int32().name("id"));
+        Schema env = SchemaBuilder.struct().name("server.db.orders.Envelope")
+                .field("op", Schema.STRING_SCHEMA)
+                .field("before", row)
+                .field("after", row)
+                .field("source", sqlServerSource)
+                .build();
+        Struct after = new Struct(row).put("id", 1);
+
+        Struct laterSource = new Struct(sqlServerSource)
+                .put("commit_lsn", "000894a8:000b53bb:000a")
+                .put("change_lsn", "000894a8:000b4c4d:0103");
+        Struct earlierSource = new Struct(sqlServerSource)
+                .put("commit_lsn", "000894a8:000b53bb:000a")
+                .put("change_lsn", "000894a8:000b4c4d:00eb");
+
+        BigInteger laterVersion = (BigInteger) convert(new Struct(env)
+                .put("op", "u").put("after", after).put("source", laterSource))
+                .getJsonMap().get("_version").getObject();
+        BigInteger earlierVersion = (BigInteger) convert(new Struct(env)
+                .put("op", "u").put("after", after).put("source", earlierSource))
+                .getJsonMap().get("_version").getObject();
+
+        assertTrue(laterVersion.compareTo(earlierVersion) > 0,
+                "change_lsn slot 0x0103 (259) must version-sort above slot 0x00eb (235)");
+
+        long commitPacked = (0x94a8L << 48) | (0x000b53bbL << 16) | 0x000aL;
+        long changePacked = (0x94a8L << 48) | (0x000b4c4dL << 16) | 0x0103L;
+        BigInteger expected = BigInteger.valueOf(commitPacked).and(BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE)).shiftLeft(64)
+                .or(BigInteger.valueOf(changePacked).and(BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE)));
+        assertEquals(expected, laterVersion);
+    }
+
+    @Test
+    @DisplayName("SQL Server commit_lsn with masked top bit set stays a positive composite (regression)")
+    void version_sqlServerCommitLsn_topBitSetStaysPositive() {
+        // VLF sequence number 0xffff has its masked-field top bit set. Before this fix,
+        // BigInteger.valueOf(commitPacked) on a long with bit 63 set is NEGATIVE, and
+        // shiftLeft(64) preserved that sign — corrupting the composite into a negative
+        // (i.e. lowest-possible-sorting) version despite representing a huge, valid LSN.
+        Schema sqlServerSource = SchemaBuilder.struct().optional()
+                .field("commit_lsn", Schema.OPTIONAL_STRING_SCHEMA)
+                .field("change_lsn", Schema.OPTIONAL_STRING_SCHEMA)
+                .build();
+        Schema row = rowSchema(SchemaBuilder.int32().name("id"));
+        Schema env = SchemaBuilder.struct().name("server.db.orders.Envelope")
+                .field("op", Schema.STRING_SCHEMA)
+                .field("before", row)
+                .field("after", row)
+                .field("source", sqlServerSource)
+                .build();
+        Struct after = new Struct(row).put("id", 1);
+        Struct source = new Struct(sqlServerSource)
+                .put("commit_lsn", "0000ffff:00000001:0001")
+                .put("change_lsn", null);
+
+        Record record = convert(new Struct(env).put("op", "u").put("after", after).put("source", source));
+        BigInteger version = (BigInteger) record.getJsonMap().get("_version").getObject();
+
+        assertTrue(version.signum() > 0, "composite version must be positive, not corrupted by sign extension");
+
+        long commitPacked = (0xffffL << 48) | (0x00000001L << 16) | 0x0001L;
+        BigInteger expected = BigInteger.valueOf(commitPacked)
+                .and(BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE)).shiftLeft(64);
+        assertEquals(expected, version);
     }
 
     @Test

@@ -251,13 +251,22 @@ public class DebeziumRecordConvertor extends RecordConvertor {
         return null;
     }
 
+    /**
+     * SQL Server's true LSN is 80 bits (32+32+16), which doesn't fit in a 64-bit long, so one
+     * field must be trimmed. The VLF sequence number (component 1) only increments when a new
+     * virtual log file is created, so 65536 (16 bits) is safe for any realistic deployment
+     * lifetime. The slot number (component 3) gets the full 16 bits real values need — slot
+     * numbers routinely exceed 255 within a single busy log block, and an 8-bit mask there
+     * previously truncated them, corrupting version ordering for transactions with >255 row
+     * changes (e.g. change_lsn slot 0x0103 collapsed to 0x03, sorting below slot 0x00eb).
+     */
     private static long packSqlServerLsn(String lsn) {
         String[] parts = lsn.split(":");
         if (parts.length != 3) return 0L;
-        long p1 = Long.parseLong(parts[0].trim(), 16) & 0xFFFFFFL;     // 24 bits
+        long p1 = Long.parseLong(parts[0].trim(), 16) & 0xFFFFL;       // 16 bits
         long p2 = Long.parseLong(parts[1].trim(), 16) & 0xFFFFFFFFL;   // 32 bits
-        long p3 = Long.parseLong(parts[2].trim(), 16) & 0xFFL;         //  8 bits
-        return (p1 << 40) | (p2 << 8) | p3;
+        long p3 = Long.parseLong(parts[2].trim(), 16) & 0xFFFFL;       // 16 bits
+        return (p1 << 48) | (p2 << 16) | p3;
     }
 
     private static String bytesToHex(byte[] bytes) {
@@ -353,21 +362,30 @@ public class DebeziumRecordConvertor extends RecordConvertor {
         // Higher commit_lsn always wins; within same commit, higher change_lsn wins.
         try {
             long commitPacked = 0L;
+            boolean hasCommit = false;
             Object commitLsn = source.get(FIELD_COMMIT_LSN);
             if (commitLsn instanceof String) {
                 commitPacked = packSqlServerLsn((String) commitLsn);
+                hasCommit = true;
             }
 
             long changePacked = 0L;
+            boolean hasChange = false;
             Object changeLsn = source.get(FIELD_CHANGE_LSN);
             if (changeLsn instanceof String) {
                 changePacked = packSqlServerLsn((String) changeLsn);
+                hasChange = true;
             }
 
-            if (commitPacked > 0 || changePacked > 0) {
-                BigInteger high = BigInteger.valueOf(commitPacked).shiftLeft(64);
-                BigInteger low  = BigInteger.valueOf(changePacked).and(
-                        BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE));
+            if (hasCommit || hasChange) {
+                // packSqlServerLsn's top bit (bit 63, the VLF sequence number's MSB) is set
+                // whenever that field is >= 0x8000, which happens routinely — mask both halves
+                // to unsigned before combining, or a set top bit makes commitPacked/changePacked
+                // read as a negative long and corrupts the composite (and the presence check
+                // above, hence hasCommit/hasChange instead of a signed "> 0" comparison).
+                BigInteger unsignedMask64 = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE);
+                BigInteger high = BigInteger.valueOf(commitPacked).and(unsignedMask64).shiftLeft(64);
+                BigInteger low  = BigInteger.valueOf(changePacked).and(unsignedMask64);
                 return high.or(low);
             }
         } catch (Exception e) {
