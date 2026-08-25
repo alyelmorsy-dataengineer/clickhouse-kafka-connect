@@ -9,6 +9,10 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -171,5 +175,28 @@ public class UtilsTest {
                 "Third diff should describe addition: " + posThreeDiff);
         assertTrue(posThreeDiff.contains("new_col"),
                 "Third diff should mention the new column name: " + posThreeDiff);
+    }
+
+    @Test
+    @DisplayName("reinterpretUtcAsZone re-localizes the same wall-clock digits in the target zone")
+    public void reinterpretUtcAsZone_reLocalizesWallClockDigits() {
+        // A naive "2026-08-24 14:03:11.543" that got epoch-ized as if it were already UTC
+        // (Debezium's SQL Server connector convention for a naive DATETIME column).
+        Instant mislabeledAsUtc = LocalDateTime.of(2026, 8, 24, 14, 3, 11, 543_000_000)
+                .toInstant(ZoneOffset.UTC);
+
+        Instant corrected = Utils.reinterpretUtcAsZone(mislabeledAsUtc, ZoneId.of("Africa/Cairo"));
+
+        Instant expected = LocalDateTime.of(2026, 8, 24, 14, 3, 11, 543_000_000)
+                .atZone(ZoneId.of("Africa/Cairo"))
+                .toInstant();
+        assertEquals(expected, corrected);
+    }
+
+    @Test
+    @DisplayName("reinterpretUtcAsZone is a no-op when sourceZone is UTC")
+    public void reinterpretUtcAsZone_noOpForUtc() {
+        Instant instant = Instant.parse("2026-08-24T14:03:11.543Z");
+        assertEquals(instant, Utils.reinterpretUtcAsZone(instant, ZoneOffset.UTC));
     }
 }

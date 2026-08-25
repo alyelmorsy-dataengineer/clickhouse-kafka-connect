@@ -31,6 +31,12 @@
   zero. A UUID string previously failed with `Illegal embedded sign character` from `BigInteger(String)`.
   Conversion failures now throw a `DataException` naming the column and the offending value instead of a
   bare `ClassCastException`/`NumberFormatException`.
+* Debezium CDC: a naive, offset-less temporal source column (e.g. SQL Server `DATETIME`/`DATETIME2`) that
+  actually holds local wall-clock time was silently written to ClickHouse as if it were already UTC —
+  Debezium has no timezone option for connectors like SQL Server, so it always treats such values as UTC
+  with zero conversion. New `naiveTimestampZones` config (`<table>.<column>=<ZoneId>`, semicolon-separated,
+  e.g. `bo_invoice.CreateDate=Africa/Cairo`) re-localizes specific fields in their true source zone before
+  writing. Disabled by default: any column not listed keeps the existing UTC-passthrough behavior.
 
 # 1.3.10, 2026-05-26
 
