@@ -14,6 +14,9 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -24,6 +27,19 @@ public class Utils {
     public static String escapeName(String topic) {
         String cleanTopic = topic.replace("`", "");
         return String.format("`%s`", cleanTopic);
+    }
+
+    /**
+     * Recovers the wall-clock digits an instant would render as in UTC, then re-localizes those
+     * same digits in {@code sourceZone}. Used for a naive (offset-less) source value that got
+     * epoch-ized as if it were already UTC (e.g. Debezium's SQL Server connector, which has no
+     * timezone option) but actually held local wall-clock time in {@code sourceZone}.
+     */
+    public static Instant reinterpretUtcAsZone(Instant utcInstant, ZoneId sourceZone) {
+        return utcInstant.atZone(ZoneOffset.UTC)
+                         .toLocalDateTime()
+                         .atZone(sourceZone)
+                         .toInstant();
     }
 
     public static String escapeTableName(String database, String topicName) {

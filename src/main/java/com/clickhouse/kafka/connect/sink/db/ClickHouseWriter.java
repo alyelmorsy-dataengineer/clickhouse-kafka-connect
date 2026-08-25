@@ -45,7 +45,6 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
@@ -490,9 +489,7 @@ public class ClickHouseWriter implements DBWriter {
         if (sourceZone == null) {
             return date;
         }
-        LocalDateTime naiveWallClock = LocalDateTime.ofInstant(date.toInstant(), ZoneOffset.UTC);
-        Instant correctedInstant = naiveWallClock.atZone(sourceZone).toInstant();
-        return Date.from(correctedInstant);
+        return Date.from(Utils.reinterpretUtcAsZone(date.toInstant(), sourceZone));
     }
 
     private void doWriteDate(OutputStream stream, Date date, int precision ) throws IOException {
