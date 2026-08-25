@@ -8,6 +8,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -48,6 +49,7 @@ public class ClickHouseSinkConfig {
     public static final String DB_TOPIC_SPLIT_CHAR = "dbTopicSplitChar";
     public static final String KEEPER_ON_CLUSTER = "keeperOnCluster";
     public static final String DATE_TIME_FORMAT = "dateTimeFormats";
+    public static final String NAIVE_TIMESTAMP_ZONES = "naiveTimestampZones";
     public static final String TOLERATE_STATE_MISMATCH = "tolerateStateMismatch";
     public static final String BYPASS_SCHEMA_VALIDATION = "bypassSchemaValidation";
     public static final String BYPASS_FIELD_CLEANUP = "bypassFieldCleanup";
@@ -109,6 +111,7 @@ public class ClickHouseSinkConfig {
     private final String dbTopicSplitChar;
     private final String keeperOnCluster;
     private final Map<String, DateTimeFormatter> dateTimeFormats;
+    private final Map<String, ZoneId> naiveTimestampZones;
     private final String clientVersion;
     private final boolean tolerateStateMismatch;
     private final boolean bypassSchemaValidation;
@@ -292,6 +295,17 @@ public class ClickHouseSinkConfig {
                 String [] propSplit = topicToDateTimeFormat.trim().split("=");
                 if ( propSplit.length == 2 ) {
                     dateTimeFormats.put(propSplit[0].trim(), DateTimeFormatter.ofPattern(propSplit[1].trim()));
+                }
+            }
+        }
+        this.naiveTimestampZones = new HashMap<>();
+        String naiveTimestampZonesString = props.getOrDefault(NAIVE_TIMESTAMP_ZONES, "").trim();
+        if (!naiveTimestampZonesString.isBlank()) {
+            String [] stringSplit = naiveTimestampZonesString.split(";");
+            for (String tableColumnToZone: stringSplit) {
+                String [] propSplit = tableColumnToZone.trim().split("=");
+                if ( propSplit.length == 2 ) {
+                    naiveTimestampZones.put(propSplit[0].trim(), ZoneId.of(propSplit[1].trim()));
                 }
             }
         }
@@ -632,6 +646,19 @@ public class ClickHouseSinkConfig {
                 ++orderInGroup,
                 ConfigDef.Width.SHORT,
                 "Date time formats.");
+        configDef.define(NAIVE_TIMESTAMP_ZONES,
+                ConfigDef.Type.LIST,
+                "",
+                ConfigDef.Importance.LOW,
+                "Reinterprets a naive (offset-less) Debezium timestamp field as local time in the given zone " +
+                        "instead of UTC, keyed by '<table>.<column>' (e.g. 'bo_invoice.CreateDate=Africa/Cairo'). " +
+                        "Debezium has no timezone option for connectors like SQL Server, so a source DATETIME " +
+                        "column populated with local wall-clock time is otherwise treated as if it were already " +
+                        "UTC with zero conversion. default: ''",
+                group,
+                ++orderInGroup,
+                ConfigDef.Width.SHORT,
+                "Naive timestamp source zones.");
         configDef.define(CLIENT_VERSION,
                 ConfigDef.Type.STRING,
                 "",

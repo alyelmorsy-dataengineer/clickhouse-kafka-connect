@@ -45,7 +45,9 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -357,7 +359,7 @@ public class ClickHouseWriter implements DBWriter {
      */
     private int[] BASES = new int[] { 1_000, 100, 10, 1, 10, 100, 1_000, 10_000, 100_000, 1_000_000 };
 
-    protected void doWriteDates(Type type, OutputStream stream, Data value, int precision, String columnName) throws IOException {
+    protected void doWriteDates(Type type, OutputStream stream, Data value, int precision, String columnName, String tableName) throws IOException {
         // TODO: develop more specific tests to have better coverage
         if (value.getObject() == null) {
             BinaryStreamUtils.writeNull(stream);
@@ -396,7 +398,7 @@ public class ClickHouseWriter implements DBWriter {
             case DateTime:
                 if (value.getFieldType().equals(Schema.Type.INT32) || value.getFieldType().equals(Schema.Type.INT64)) {
                     if (value.getObject().getClass().getName().endsWith(".Date")) {
-                        Date date = (Date) value.getObject();
+                        Date date = reinterpretNaiveTimestampZone((Date) value.getObject(), tableName, columnName);
                         BinaryStreamUtils.writeUnsignedInt32(stream, date.toInstant().getEpochSecond());
                     } else {
                         BinaryStreamUtils.writeUnsignedInt32(stream, Long.parseLong(String.valueOf(value.getObject())));
@@ -416,12 +418,12 @@ public class ClickHouseWriter implements DBWriter {
             case DateTime64:
                 if ( value.getFieldType().equals(Schema.Type.INT64)) {
                     if (value.getObject() instanceof Date) {
-                        doWriteDate(stream, (Date) value.getObject(), precision);
+                        doWriteDate(stream, reinterpretNaiveTimestampZone((Date) value.getObject(), tableName, columnName), precision);
                     } else {
                         BinaryStreamUtils.writeInt64(stream, (Long) value.getObject());
                     }
                 } else if (value.getFieldType().equals(Schema.Type.INT32) && value.getObject() instanceof Date) {
-                    doWriteDate(stream, (Date) value.getObject(), precision);
+                    doWriteDate(stream, reinterpretNaiveTimestampZone((Date) value.getObject(), tableName, columnName), precision);
                 } else if (value.getFieldType().equals(Schema.Type.STRING)) {
                     try {
                         long seconds;
@@ -475,6 +477,24 @@ public class ClickHouseWriter implements DBWriter {
         }
     }
 
+    /**
+     * Debezium (and Kafka Connect's own Timestamp logical type) has no way to tag a naive,
+     * offset-less source column as anything but UTC - a source DATETIME column that actually
+     * holds local wall-clock time (e.g. SQL Server, which has no per-connector timezone option)
+     * arrives here as an instant that mislabels those local digits as UTC. When {@code tableName.columnName}
+     * is present in {@code naiveTimestampZones}, recover the original wall-clock digits and
+     * re-localize them in the configured zone to get the true instant.
+     */
+    private Date reinterpretNaiveTimestampZone(Date date, String tableName, String columnName) {
+        ZoneId sourceZone = csc.getNaiveTimestampZones().get(tableName + "." + columnName);
+        if (sourceZone == null) {
+            return date;
+        }
+        LocalDateTime naiveWallClock = LocalDateTime.ofInstant(date.toInstant(), ZoneOffset.UTC);
+        Instant correctedInstant = naiveWallClock.atZone(sourceZone).toInstant();
+        return Date.from(correctedInstant);
+    }
+
     private void doWriteDate(OutputStream stream, Date date, int precision ) throws IOException {
         long ts = date.getTime();
         if (precision > 3) {
@@ -485,7 +505,7 @@ public class ClickHouseWriter implements DBWriter {
         BinaryStreamUtils.writeInt64(stream, ts);
     }
 
-    protected void doWriteColValue(Column col, OutputStream stream, Data value, boolean defaultsSupport) throws IOException {
+    protected void doWriteColValue(Column col, OutputStream stream, Data value, boolean defaultsSupport, String tableName) throws IOException {
         Type columnType = col.getType();
 
         try {
@@ -518,7 +538,7 @@ public class ClickHouseWriter implements DBWriter {
                 case Date32:
                 case DateTime:
                 case DateTime64:
-                    doWriteDates(columnType, stream, value, col.getPrecision(), col.getName());
+                    doWriteDates(columnType, stream, value, col.getPrecision(), col.getName(), tableName);
                     break;
                 case Decimal:
                     if (value.getObject() == null) {
@@ -542,7 +562,7 @@ public class ClickHouseWriter implements DBWriter {
                             if (col.getMapValueType() != null && col.getMapValueType().isNullable() && mapValue != null) {
                                 BinaryStreamUtils.writeNonNull(stream);
                             }
-                            doWriteColValue(col.getMapValueType(), stream, new Data(value.getNestedValueSchema(), mapValue), defaultsSupport);
+                            doWriteColValue(col.getMapValueType(), stream, new Data(value.getNestedValueSchema(), mapValue), defaultsSupport, tableName);
                         } catch (IOException e) {
                             throw new RuntimeException(e);
                         }
@@ -563,7 +583,7 @@ public class ClickHouseWriter implements DBWriter {
                                 if (col.getArrayType().isNullable() && v != null) {
                                     BinaryStreamUtils.writeNonNull(stream);
                                 }
-                                doWriteColValue(col.getArrayType(), stream, new Data(value.getNestedValueSchema(), v), defaultsSupport);
+                                doWriteColValue(col.getArrayType(), stream, new Data(value.getNestedValueSchema(), v), defaultsSupport, tableName);
                             } catch (IOException e) {
                                 throw new RuntimeException(e);
                             }
@@ -587,7 +607,7 @@ public class ClickHouseWriter implements DBWriter {
                         Data innerData = (Data) jsonMapValues.get(fieldName);
                         try {
                             // we need to apply here the default and nullable logic
-                            doWriteCol(innerData, jsonMapValues.containsKey(fieldName), column, stream, false);
+                            doWriteCol(innerData, jsonMapValues.containsKey(fieldName), column, stream, false, tableName);
                         } catch (IOException e) {
                             throw new RuntimeException(e);
                         }
@@ -624,7 +644,8 @@ public class ClickHouseWriter implements DBWriter {
                                 col.getVariantGlobalDiscriminators().get(globalDiscriminator.get()).getT1(),
                                 stream,
                                 variantValue,
-                                defaultsSupport
+                                defaultsSupport,
+                                tableName
                         );
                     }
                     break;
@@ -860,7 +881,7 @@ public class ClickHouseWriter implements DBWriter {
      * @param defaultsSupport Indicate if the defaults values in fields at the level
      * @throws IOException
      */
-    protected void doWriteCol(Data value, boolean fieldExists, Column col, OutputStream stream, boolean defaultsSupport) throws IOException {
+    protected void doWriteCol(Data value, boolean fieldExists, Column col, OutputStream stream, boolean defaultsSupport, String tableName) throws IOException {
         LOGGER.trace("Writing column {} to stream", col.getName());
         LOGGER.trace("Column type is {}", col.getType());
         String name = col.getName();
@@ -909,7 +930,7 @@ public class ClickHouseWriter implements DBWriter {
                 }
             }
 
-            doWriteColValue(col, stream, value, defaultsSupport);
+            doWriteColValue(col, stream, value, defaultsSupport, tableName);
         } else {
             if (col.hasDefault()) {
                 BinaryStreamUtils.writeNull(stream);
@@ -1082,7 +1103,7 @@ public class ClickHouseWriter implements DBWriter {
                     String name = col.getName();
                     boolean filedExists = record.getJsonMap().containsKey(name);
                     Data value = record.getJsonMap().get(name);
-                    doWriteCol(value, filedExists, col, stream, supportDefaults);
+                    doWriteCol(value, filedExists, col, stream, supportDefaults, table.getName());
                     pushStreamTime += System.currentTimeMillis() - beforePushStream;
                 }
             }
@@ -1143,7 +1164,7 @@ public class ClickHouseWriter implements DBWriter {
                             String name = col.getName();
                             boolean filedExists = record.getJsonMap().containsKey(name);
                             Data value = record.getJsonMap().get(name);
-                            doWriteCol(value, filedExists, col, stream, supportDefaults);
+                            doWriteCol(value, filedExists, col, stream, supportDefaults, table.getName());
                             pushStreamTime += System.currentTimeMillis() - beforePushStream;
                         }
                     }
