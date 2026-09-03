@@ -46,6 +46,7 @@ import java.io.OutputStream;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -396,7 +397,7 @@ public class ClickHouseWriter implements DBWriter {
             case DateTime:
                 if (value.getFieldType().equals(Schema.Type.INT32) || value.getFieldType().equals(Schema.Type.INT64)) {
                     if (value.getObject().getClass().getName().endsWith(".Date")) {
-                        Date date = (Date) value.getObject();
+                        Date date = reinterpretNaiveTimestampZone((Date) value.getObject());
                         BinaryStreamUtils.writeUnsignedInt32(stream, date.toInstant().getEpochSecond());
                     } else {
                         BinaryStreamUtils.writeUnsignedInt32(stream, Long.parseLong(String.valueOf(value.getObject())));
@@ -416,12 +417,12 @@ public class ClickHouseWriter implements DBWriter {
             case DateTime64:
                 if ( value.getFieldType().equals(Schema.Type.INT64)) {
                     if (value.getObject() instanceof Date) {
-                        doWriteDate(stream, (Date) value.getObject(), precision);
+                        doWriteDate(stream, reinterpretNaiveTimestampZone((Date) value.getObject()), precision);
                     } else {
                         BinaryStreamUtils.writeInt64(stream, (Long) value.getObject());
                     }
                 } else if (value.getFieldType().equals(Schema.Type.INT32) && value.getObject() instanceof Date) {
-                    doWriteDate(stream, (Date) value.getObject(), precision);
+                    doWriteDate(stream, reinterpretNaiveTimestampZone((Date) value.getObject()), precision);
                 } else if (value.getFieldType().equals(Schema.Type.STRING)) {
                     try {
                         long seconds;
@@ -473,6 +474,22 @@ public class ClickHouseWriter implements DBWriter {
             LOGGER.error(msg);
             throw new DataException(msg);
         }
+    }
+
+    /**
+     * Debezium (and Kafka Connect's own Timestamp logical type) has no way to tag a naive,
+     * offset-less source column as anything but UTC - a source DATETIME column that actually
+     * holds local wall-clock time (e.g. SQL Server, which has no per-connector timezone option)
+     * arrives here as an instant that mislabels those local digits as UTC. When
+     * {@code naiveTimestampZone} is configured, recover the original wall-clock digits and
+     * re-localize them in the configured zone to get the true instant.
+     */
+    private Date reinterpretNaiveTimestampZone(Date date) {
+        ZoneId sourceZone = csc.getNaiveTimestampZone();
+        if (sourceZone == null) {
+            return date;
+        }
+        return Date.from(Utils.reinterpretUtcAsZone(date.toInstant(), sourceZone));
     }
 
     private void doWriteDate(OutputStream stream, Date date, int precision ) throws IOException {
